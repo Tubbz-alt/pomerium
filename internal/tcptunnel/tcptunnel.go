@@ -25,10 +25,10 @@ type Tunnel struct {
 }
 
 // New creates a new Tunnel.
-func New() *Tunnel {
+func New(proxyHost, dstHost string, tlsConfig *tls.Config) *Tunnel {
 	return &Tunnel{
-		proxyHost: "redis.caleb-pc-linux.doxsey.net:443",
-		dstHost:   "redis.caleb-pc-linux.doxsey.net:22",
+		proxyHost: proxyHost,
+		dstHost:   dstHost,
 		tlsConfig: new(tls.Config),
 	}
 }
@@ -141,7 +141,10 @@ func (tun *Tunnel) Run(ctx context.Context, local io.ReadWriter) error {
 
 	select {
 	case err := <-errc:
-		return fmt.Errorf("tcptunnel: %w", err)
+		if err != nil {
+			err = fmt.Errorf("tcptunnel: %w", err)
+		}
+		return err
 	case <-ctx.Done():
 		return nil
 	}
