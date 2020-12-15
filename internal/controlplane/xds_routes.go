@@ -205,6 +205,11 @@ func buildPolicyRoutes(options *config.Options, domain string) []*envoy_config_r
 					UpgradeType: "spdy/3.1",
 					Enabled:     &wrappers.BoolValue{Value: policy.AllowSPDY},
 				},
+				{
+					UpgradeType:   "CONNECT",
+					Enabled:       &wrappers.BoolValue{Value: urlutil.IsTCP(policy.Source.URL)},
+					ConnectConfig: &envoy_config_route_v3.RouteAction_UpgradeConfig_ConnectConfig{},
+				},
 			},
 			HostRewriteSpecifier: &envoy_config_route_v3.RouteAction_AutoHostRewrite{
 				AutoHostRewrite: &wrappers.BoolValue{Value: !policy.PreserveHostHeader},
@@ -271,6 +276,10 @@ func toEnvoyHeaders(headers map[string]string) []*envoy_config_core_v3.HeaderVal
 func mkRouteMatch(policy *config.Policy) *envoy_config_route_v3.RouteMatch {
 	match := &envoy_config_route_v3.RouteMatch{}
 	switch {
+	case urlutil.IsTCP(policy.Source.URL):
+		match.PathSpecifier = &envoy_config_route_v3.RouteMatch_ConnectMatcher_{
+			ConnectMatcher: &envoy_config_route_v3.RouteMatch_ConnectMatcher{},
+		}
 	case policy.Regex != "":
 		match.PathSpecifier = &envoy_config_route_v3.RouteMatch_SafeRegex{
 			SafeRegex: &envoy_type_matcher_v3.RegexMatcher{
