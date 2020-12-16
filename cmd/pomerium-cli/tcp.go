@@ -77,9 +77,9 @@ var tcpCmd = &cobra.Command{
 		}()
 
 		err = tcptunnel.New(
-			pomeriumURL.Host,
-			dstHost,
-			tlsConfig,
+			tcptunnel.WithDestinationHost(dstHost),
+			tcptunnel.WithProxyHost(pomeriumURL.Host),
+			tcptunnel.WithTLSConfig(tlsConfig),
 		).RunListener(ctx, tcpCmdOptions.listen)
 		if err != nil {
 			_, _ = fmt.Fprintf(os.Stderr, "%s\n", err.Error())

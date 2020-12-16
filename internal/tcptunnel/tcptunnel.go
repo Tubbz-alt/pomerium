@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,8 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/pomerium/pomerium/internal/authclient"
+	"github.com/pomerium/pomerium/internal/cliutil"
 	"github.com/pomerium/pomerium/internal/log"
 
 	backoff "github.com/cenkalti/backoff/v4"
@@ -19,17 +22,16 @@ import (
 
 // A Tunnel represents a TCP tunnel over HTTP Connect.
 type Tunnel struct {
-	proxyHost string
-	dstHost   string
-	tlsConfig *tls.Config
+	cfg  *config
+	auth *authclient.AuthClient
 }
 
 // New creates a new Tunnel.
-func New(proxyHost, dstHost string, tlsConfig *tls.Config) *Tunnel {
+func New(options ...Option) *Tunnel {
+	cfg := getConfig(options...)
 	return &Tunnel{
-		proxyHost: proxyHost,
-		dstHost:   dstHost,
-		tlsConfig: new(tls.Config),
+		cfg:  cfg,
+		auth: authclient.New(authclient.WithTLSConfig(cfg.tlsConfig)),
 	}
 }
 
@@ -85,24 +87,43 @@ func (tun *Tunnel) RunListener(ctx context.Context, listenerAddress string) erro
 
 // Run establishes a TCP tunnel via HTTP Connect and forwards all traffic from/to local.
 func (tun *Tunnel) Run(ctx context.Context, local io.ReadWriter) error {
+	rawJWT, err := tun.cfg.jwtCache.LoadJWT(tun.jwtCacheKey())
+	switch {
+	case err == nil:
+	case errors.Is(err, cliutil.ErrExpired):
+	case errors.Is(err, cliutil.ErrInvalid):
+	case errors.Is(err, cliutil.ErrNotFound):
+	default:
+		return fmt.Errorf("tcptunnel: failed to load JWT: %w", err)
+	}
+	return tun.run(ctx, local, rawJWT)
+}
+
+func (tun *Tunnel) run(ctx context.Context, local io.ReadWriter, rawJWT string) error {
 	log.Info().
-		Str("dst", tun.dstHost).
-		Str("proxy", tun.proxyHost).
-		Bool("secure", tun.tlsConfig != nil).
+		Str("dst", tun.cfg.dstHost).
+		Str("proxy", tun.cfg.proxyHost).
+		Bool("secure", tun.cfg.tlsConfig != nil).
 		Msg("tcptunnel: opening connection")
+
+	hdr := http.Header{}
+	if rawJWT != "" {
+		hdr.Set("Authorization", "Pomerium "+rawJWT)
+	}
 
 	req := (&http.Request{
 		Method: "CONNECT",
-		URL:    &url.URL{Opaque: tun.dstHost},
-		Host:   tun.dstHost,
+		URL:    &url.URL{Opaque: tun.cfg.dstHost},
+		Host:   tun.cfg.dstHost,
+		Header: hdr,
 	}).WithContext(ctx)
 
 	var remote net.Conn
 	var err error
-	if tun.tlsConfig != nil {
-		remote, err = (&tls.Dialer{Config: tun.tlsConfig}).DialContext(ctx, "tcp", tun.proxyHost)
+	if tun.cfg.tlsConfig != nil {
+		remote, err = (&tls.Dialer{Config: tun.cfg.tlsConfig}).DialContext(ctx, "tcp", tun.cfg.proxyHost)
 	} else {
-		remote, err = (&net.Dialer{}).DialContext(ctx, "tcp", tun.proxyHost)
+		remote, err = (&net.Dialer{}).DialContext(ctx, "tcp", tun.cfg.proxyHost)
 	}
 	if err != nil {
 		return fmt.Errorf("tcptunnel: failed to establish connection to proxy: %w", err)
@@ -123,7 +144,34 @@ func (tun *Tunnel) Run(ctx context.Context, local io.ReadWriter) error {
 		return fmt.Errorf("tcptunnel: failed to read HTTP response: %w", err)
 	}
 	defer func() { _ = res.Body.Close() }()
-	if res.StatusCode != 200 {
+	switch res.StatusCode {
+	case http.StatusOK:
+	case http.StatusMovedPermanently,
+		http.StatusFound,
+		http.StatusTemporaryRedirect,
+		http.StatusPermanentRedirect:
+		if rawJWT == "" {
+			_ = remote.Close()
+
+			authURL, err := url.Parse(res.Header.Get("Location"))
+			if err != nil {
+				return fmt.Errorf("tcptunnel: invalid redirect location for authentication: %w", err)
+			}
+
+			rawJWT, err = tun.auth.GetJWT(ctx, authURL)
+			if err != nil {
+				return fmt.Errorf("tcptunnel: failed to get authentication JWT: %w", err)
+			}
+
+			err = tun.cfg.jwtCache.StoreJWT(tun.jwtCacheKey(), rawJWT)
+			if err != nil {
+				return fmt.Errorf("tcptunnel: failed to store JWT: %w", err)
+			}
+
+			return tun.run(ctx, local, rawJWT)
+		}
+		fallthrough
+	default:
 		return fmt.Errorf("tcptunnel: invalid http response code: %d", res.StatusCode)
 	}
 
@@ -148,4 +196,8 @@ func (tun *Tunnel) Run(ctx context.Context, local io.ReadWriter) error {
 	case <-ctx.Done():
 		return nil
 	}
+}
+
+func (tun *Tunnel) jwtCacheKey() string {
+	return fmt.Sprintf("%s|%s|%v", tun.cfg.dstHost, tun.cfg.proxyHost, tun.cfg.tlsConfig != nil)
 }
